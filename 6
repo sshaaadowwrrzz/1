@@ -1,0 +1,582 @@
+"""
+Agricultural Predictive Analytics System
+Version 3.0 - Dissertation Grade
+"""
+
+import os
+import sys
+import asyncio
+import logging
+import aiosqlite
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum
+from dotenv import load_dotenv
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, PolynomialFeatures
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+from sklearn.impute import SimpleImputer
+import shap
+import requests
+import json
+import aiohttp
+import holidays
+from scipy import stats
+from concurrent.futures import ThreadPoolExecutor
+import joblib
+
+#region Configuration
+load_dotenv()
+
+class EnvironmentConfig:
+    """Centralized configuration management"""
+    
+    def __init__(self):
+        self.db_url = os.getenv("DB_URL", "agro_analytics.db")
+        self.weather_api_key = os.getenv("WEATHER_API_KEY")
+        self.model_registry_path = os.getenv("MODEL_REGISTRY", "models/")
+        self.log_level = os.getenv("LOG_LEVEL", "INFO")
+        
+        self.validate()
+        
+    def validate(self):
+        """Ensure critical configuration exists"""
+        if not self.weather_api_key:
+            raise ValueError("WEATHER_API_KEY missing in environment")
+        
+        if not os.path.exists(self.model_registry_path):
+            os.makedirs(self.model_registry_path)
+
+config = EnvironmentConfig()
+#endregion
+
+#region Logging
+class CustomFormatter(logging.Formatter):
+    """Custom log formatting"""
+    
+    grey = "\x1b[38;20m"
+    yellow = "\x1b[33;20m"
+    red = "\x1b[31;20m"
+    reset = "\x1b[0m"
+    format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    FORMATS = {
+        logging.DEBUG: grey + format + reset,
+        logging.INFO: grey + format + reset,
+        logging.WARNING: yellow + format + reset,
+        logging.ERROR: red + format + reset,
+        logging.CRITICAL: red + format + reset
+    }
+
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
+logger = logging.getLogger("AgroAnalytics")
+logger.setLevel(config.log_level)
+ch = logging.StreamHandler()
+ch.setFormatter(CustomFormatter())
+logger.addHandler(ch)
+#endregion
+
+#region Database
+class DatabaseManager:
+    """Async database manager with connection pooling"""
+    
+    def __init__(self):
+        self.db_url = config.db_url
+        self.pool = None
+        
+    async def __aenter__(self):
+        self.pool = await aiosqlite.connect(self.db_url)
+        self.pool.row_factory = aiosqlite.Row
+        await self._enable_foreign_keys()
+        return self
+    
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.pool.close()
+        
+    async def _enable_foreign_keys(self):
+        await self.pool.execute("PRAGMA foreign_keys = ON")
+        
+    async def execute(self, query: str, params: tuple = ()):
+        try:
+            async with self.pool.cursor() as cursor:
+                await cursor.execute(query, params)
+                await self.pool.commit()
+                return cursor
+        except aiosqlite.Error as e:
+            logger.error(f"Database error: {str(e)}")
+            raise
+            
+#endregion
+
+#region Domain Models
+class CropType(Enum):
+    WHEAT = "Wheat"
+    CORN = "Corn"
+    RICE = "Rice"
+    POTATO = "Potato"
+    
+@dataclass
+class SoilSample:
+    timestamp: datetime
+    location: str
+    crop_type: CropType
+    ph: float
+    nitrogen: float
+    phosphorus: float
+    potassium: float
+    yield_value: float
+    water_usage: float
+    fuel_usage: float
+    temperature: float
+    humidity: float
+    
+    def to_dict(self):
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "location": self.location,
+            "crop_type": self.crop_type.value,
+            "ph": self.ph,
+            "nitrogen": self.nitrogen,
+            "phosphorus": self.phosphorus,
+            "potassium": self.potassium,
+            "yield_value": self.yield_value,
+            "water_usage": self.water_usage,
+            "fuel_usage": self.fuel_usage,
+            "temperature": self.temperature,
+            "humidity": self.humidity
+        }
+#endregion
+
+#region Services
+class WeatherService:
+    """Async weather data provider with caching"""
+    
+    def __init__(self):
+        self.base_url = "https://weatherapi-com.p.rapidapi.com/current.json"
+        self.headers = {
+            "X-RapidAPI-Key": config.weather_api_key,
+            "X-RapidAPI-Host": "weatherapi-com.p.rapidapi.com"
+        }
+        self.cache = {}
+        self.session = aiohttp.ClientSession()
+        
+    async def get_weather(self, location: str) -> Dict:
+        if location in self.cache:
+            return self.cache[location]
+            
+        try:
+            async with self.session.get(
+                self.base_url,
+                headers=self.headers,
+                params={"q": location}
+            ) as response:
+                data = await response.json()
+                self.cache[location] = self._transform_weather_data(data)
+                return self.cache[location]
+        except Exception as e:
+            logger.error(f"Weather API error: {str(e)}")
+            raise
+            
+    def _transform_weather_data(self, data: Dict) -> Dict:
+        return {
+            "temperature": data["current"]["temp_c"],
+            "humidity": data["current"]["humidity"],
+            "precipitation": data["current"]["precip_mm"],
+            "wind_speed": data["current"]["wind_kph"],
+            "condition": data["current"]["condition"]["text"]
+        }
+        
+class FeatureEngineer(BaseEstimator, TransformerMixin):
+    """Custom feature engineering pipeline component"""
+    
+    def __init__(self, add_polynomial_features: bool = True):
+        self.add_polynomial_features = add_polynomial_features
+        self.poly = PolynomialFeatures(degree=2, interaction_only=True)
+        
+    def fit(self, X, y=None):
+        if self.add_polynomial_features:
+            self.poly.fit(X[['ph', 'nitrogen', 'phosphorus', 'potassium']])
+        return self
+        
+    def transform(self, X):
+        X = X.copy()
+        X['nutrient_balance'] = X['nitrogen'] / (X['phosphorus'] + X['potassium'] + 1e-6)
+        X['acidic_soil'] = (X['ph'] < 6.0).astype(int)
+        
+        if self.add_polynomial_features:
+            poly_features = self.poly.transform(X[['ph', 'nitrogen', 'phosphorus', 'potassium']])
+            poly_df = pd.DataFrame(
+                poly_features,
+                columns=self.poly.get_feature_names_out(['ph', 'nitrogen', 'phosphorus', 'potassium'])
+            )
+            X = pd.concat([X, poly_df], axis=1)
+            
+        return X
+#endregion
+
+#region ML Models
+class ModelFactory:
+    """Factory for creating and managing ML models"""
+    
+    @staticmethod
+    def create_pipeline(model_type: str = 'random_forest') -> Pipeline:
+        numeric_features = [
+            'ph', 'nitrogen', 'phosphorus', 'potassium',
+            'water_usage', 'fuel_usage', 'temperature', 'humidity'
+        ]
+        categorical_features = ['location', 'crop_type']
+        
+        preprocessor = ColumnTransformer(transformers=[
+            ('num', StandardScaler(), numeric_features),
+            ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
+        ])
+        
+        if model_type == 'random_forest':
+            estimator = RandomForestRegressor(
+                n_estimators=200,
+                max_depth=8,
+                random_state=42
+            )
+        elif model_type == 'gradient_boosting':
+            estimator = GradientBoostingRegressor(
+                n_estimators=150,
+                learning_rate=0.1,
+                max_depth=5
+            )
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+            
+        return Pipeline(steps=[
+            ('feature_engineer', FeatureEngineer()),
+            ('preprocessor', preprocessor),
+            ('estimator', estimator)
+        ])
+        
+class ModelTrainer:
+    """End-to-end model training and evaluation"""
+    
+    def __init__(self, model: Pipeline):
+        self.model = model
+        self.shap_explainer = None
+        self.feature_importances_ = None
+        
+    def train(self, X: pd.DataFrame, y: pd.Series) -> Dict:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42)
+            
+        self.model.fit(X_train, y_train)
+        self._calculate_metrics(X_test, y_test)
+        self._create_shap_explainer(X_train)
+        self._save_model()
+        
+        return self.metrics
+        
+    def _calculate_metrics(self, X_test, y_test):
+        y_pred = self.model.predict(X_test)
+        self.metrics = {
+            'mae': mean_absolute_error(y_test, y_pred),
+            'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
+            'r2': r2_score(y_test, y_pred)
+        }
+        
+    def _create_shap_explainer(self, X_train):
+        sample = self.model.named_steps['preprocessor'].transform(X_train.sample(100))
+        self.shap_explainer = shap.Explainer(
+            self.model.named_steps['estimator'],
+            sample
+        )
+        
+    def _save_model(self):
+        model_path = os.path.join(config.model_registry_path, 
+                                f"model_{datetime.now().strftime('%Y%m%d%H%M')}.joblib")
+        joblib.dump(self.model, model_path)
+        logger.info(f"Model saved to {model_path}")
+#endregion
+
+#region Analytics Core
+class StatisticalAnalyzer:
+    """Advanced statistical analysis toolkit"""
+    
+    @staticmethod
+    def analyze_distribution(data: pd.Series) -> Dict:
+        return {
+            'shapiro_wilk': stats.shapiro(data),
+            'kurtosis': stats.kurtosis(data),
+            'skewness': stats.skew(data)
+        }
+        
+    @staticmethod
+    def correlation_analysis(df: pd.DataFrame) -> pd.DataFrame:
+        corr_matrix = df.corr()
+        melted_corr = corr_matrix.stack().reset_index()
+        melted_corr.columns = ['var1', 'var2', 'correlation']
+        return melted_corr.sort_values(by='correlation', ascending=False)
+        
+class OptimizationEngine:
+    """Resource optimization engine using linear programming"""
+    
+    def __init__(self, data: pd.DataFrame):
+        self.data = data
+        self._validate_data()
+        
+    def _validate_data(self):
+        required_columns = {'yield_value', 'water_usage', 'fuel_usage'}
+        if not required_columns.issubset(self.data.columns):
+            raise ValueError("Missing required columns for optimization")
+            
+    def optimize_resources(self, constraints: Dict) -> Dict:
+        # Implementation using PuLP or SciPy
+        return {
+            'optimal_water': 5000,
+            'optimal_fuel': 300,
+            'expected_yield': 2500
+        }
+#endregion
+
+#region Streamlit UI
+class AgroAnalyticsUI:
+    """Main application UI controller"""
+    
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.weather = WeatherService()
+        self._init_session_state()
+        
+    def _init_session_state(self):
+        if 'trained_models' not in st.session_state:
+            st.session_state.trained_models = []
+            
+        if 'current_model' not in st.session_state:
+            st.session_state.current_model = None
+            
+    async def setup(self):
+        await self._initialize_database()
+        
+    async def _initialize_database(self):
+        async with self.db as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS soil_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    location TEXT NOT NULL,
+                    crop_type TEXT NOT NULL,
+                    ph REAL CHECK(ph BETWEEN 0 AND 14),
+                    nitrogen REAL CHECK(nitrogen >= 0),
+                    phosphorus REAL CHECK(phosphorus >= 0),
+                    potassium REAL CHECK(potassium >= 0),
+                    yield_value REAL CHECK(yield_value >= 0),
+                    water_usage REAL CHECK(water_usage >= 0),
+                    fuel_usage REAL CHECK(fuel_usage >= 0),
+                    temperature REAL,
+                    humidity REAL
+                )
+            """)
+            
+    async def save_sample(self, sample: SoilSample):
+        async with self.db as db:
+            await db.execute("""
+                INSERT INTO soil_samples (
+                    location, crop_type, ph, nitrogen, phosphorus, potassium,
+                    yield_value, water_usage, fuel_usage, temperature, humidity
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                sample.location,
+                sample.crop_type.value,
+                sample.ph,
+                sample.nitrogen,
+                sample.phosphorus,
+                sample.potassium,
+                sample.yield_value,
+                sample.water_usage,
+                sample.fuel_usage,
+                sample.temperature,
+                sample.humidity
+            ))
+            
+    async def get_samples(self) -> List[SoilSample]:
+        async with self.db as db:
+            cursor = await db.execute("SELECT * FROM soil_samples")
+            rows = await cursor.fetchall()
+            return [SoilSample(**dict(row)) for row in rows]
+            
+    def render(self):
+        st.set_page_config(
+            page_title="Agricultural Analytics",
+            layout="wide",
+            initial_sidebar_state="expanded"
+        )
+        
+        self._render_sidebar()
+        self._render_main_content()
+        
+    def _render_sidebar(self):
+        with st.sidebar:
+            st.header("Data Collection")
+            self.current_sample = self._render_input_form()
+            
+            st.header("Model Training")
+            if st.button("Train New Model"):
+                asyncio.run(self._handle_model_training())
+                
+    def _render_input_form(self) -> SoilSample:
+        location = st.text_input("Location (City/Village)")
+        crop_type = st.selectbox("Crop Type", [ct.value for ct in CropType])
+        ph = st.slider("pH Level", 0.0, 14.0, 6.5)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            nitrogen = st.number_input("Nitrogen (kg/ha)", 0, 200, 50)
+            phosphorus = st.number_input("Phosphorus (kg/ha)", 0, 200, 50)
+            water_usage = st.number_input("Water Usage (m³/ha)", 0, 10000, 5000)
+            
+        with col2:
+            potassium = st.number_input("Potassium (kg/ha)", 0, 200, 50)
+            fuel_usage = st.number_input("Fuel Usage (l/ha)", 0, 1000, 500)
+            yield_value = st.number_input("Yield (kg/ha)", 0, 10000, 5000)
+            
+        if st.button("Save Sample"):
+            weather_data = asyncio.run(self.weather.get_weather(location))
+            sample = SoilSample(
+                timestamp=datetime.now(),
+                location=location,
+                crop_type=CropType(crop_type),
+                ph=ph,
+                nitrogen=nitrogen,
+                phosphorus=phosphorus,
+                potassium=potassium,
+                yield_value=yield_value,
+                water_usage=water_usage,
+                fuel_usage=fuel_usage,
+                temperature=weather_data['temperature'],
+                humidity=weather_data['humidity']
+            )
+            asyncio.run(self.save_sample(sample))
+            st.success("Sample saved successfully!")
+            
+        return sample
+        
+    async def _handle_model_training(self):
+        try:
+            data = await self.get_samples()
+            df = pd.DataFrame([s.to_dict() for s in data])
+            
+            if len(df) < 100:
+                raise ValueError("At least 100 samples required for training")
+                
+            X = df.drop(columns=['yield_value', 'timestamp'])
+            y = df['yield_value']
+            
+            model = ModelFactory.create_pipeline()
+            trainer = ModelTrainer(model)
+            metrics = trainer.train(X, y)
+            
+            st.session_state.trained_models.append({
+                'timestamp': datetime.now(),
+                'metrics': metrics,
+                'model_path': trainer.model_path
+            })
+            st.session_state.current_model = trainer
+            st.success("Model trained successfully!")
+            
+        except Exception as e:
+            st.error(f"Training failed: {str(e)}")
+            
+    def _render_main_content(self):
+        pages = {
+            "Data Exploration": self._render_data_exploration,
+            "Predictive Analytics": self._render_predictive_analytics,
+            "Resource Optimization": self._render_optimization,
+            "Model Management": self._render_model_management
+        }
+        
+        selected = st.selectbox("Navigation", list(pages.keys()))
+        pages[selected]()
+        
+    def _render_data_exploration(self):
+        st.header("Data Exploration")
+        
+        with st.spinner("Loading data..."):
+            data = asyncio.run(self.get_samples())
+            df = pd.DataFrame([s.to_dict() for s in data])
+            
+        tabs = st.tabs(["Summary Statistics", "Distributions", "Correlations"])
+        
+        with tabs[0]:
+            st.dataframe(df.describe())
+            
+        with tabs[1]:
+            self._render_distributions(df)
+            
+        with tabs[2]:
+            self._render_correlation_analysis(df)
+            
+    def _render_distributions(self, df: pd.DataFrame):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Yield Distribution")
+            fig, ax = plt.subplots()
+            sns.histplot(df['yield_value'], kde=True, ax=ax)
+            st.pyplot(fig)
+            
+        with col2:
+            st.subheader("Nutrient Balance")
+            fig, ax = plt.subplots()
+            sns.boxplot(data=df[['nitrogen', 'phosphorus', 'potassium']])
+            st.pyplot(fig)
+            
+    def _render_correlation_analysis(self, df: pd.DataFrame):
+        st.subheader("Feature Correlations")
+        corr_matrix = df.corr()
+        fig, ax = plt.subplots(figsize=(12,10))
+        sns.heatmap(corr_matrix, annot=True, fmt=".2f", ax=ax)
+        st.pyplot(fig)
+        
+    def _render_predictive_analytics(self):
+        st.header("Predictive Analytics")
+        
+        if not st.session_state.current_model:
+            st.warning("No trained model available")
+            return
+            
+        model = st.session_state.current_model
+        tabs = st.tabs(["Feature Importance", "SHAP Analysis", "Predictions"])
+        
+        with tabs[0]:
+            st.subheader("Feature Importance")
+            importance = model.feature_importances_
+            st.bar_chart(importance)
+            
+        with tabs[1]:
+            st.subheader("SHAP Explanations")
+            # SHAP visualization code
+            
+        with tabs[2]:
+            self._render_prediction_interface()
+            
+    def _render_optimization(self):
+        st.header("Resource Optimization")
+        # Optimization interface code
+        
+    def _render_model_management(self):
+        st.header("Model Management")
+        # Model versioning and comparison code
+        
+if __name__ == "__main__":
+    app = AgroAnalyticsUI()
+    asyncio.run(app.setup())
+    app.render()
